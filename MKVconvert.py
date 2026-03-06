@@ -1,308 +1,224 @@
 import argparse
 import cv2
-import imageio.v3
-import glob, os, shutil
-import ffmpeg
-import matplotlib.pyplot as plt
-import numpy as np
-
+import glob
+import os
+import shutil
+import logging
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import List, Optional, Tuple, Dict
 
+import ffmpeg
+import numpy as np
 import RMS.ConfigReader as cr
-from RMS.Formats.FFfits import write as writeFF
-from RMS.Formats.FFfits import filenameToDatetimeStr
-from RMS.Formats.FFfile import filenameToDatetime
+from RMS.Formats.FFfits import write as write_ff_fits
+from RMS.Formats.FFfits import filenameToDatetimeStr as filename_to_datetime_str
+from RMS.Formats.FFfile import filenameToDatetime as filename_to_datetime
 from RMS.Formats.FFStruct import FFStruct
 from RMS.Formats.FTPdetectinfo import validDefaultFTPdetectinfo, findFTPdetectinfoFile, readFTPdetectinfo
 
-from astropy.io import fits
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-def nearestDatetime(dt_list, ntime):
-	time_diff = np.abs([date - ntime for date in dt_list])
-	nt = min(dt_list, key=lambda x: abs(x - ntime))
-	n = time_diff.argmin(0)
+class MeteorDetection:
+    def __init__(self, ff_filename: str, station_id: str, meteor_num: int, fps: float, segments: List):
+        self.ff_filename = ff_filename
+        self.station_id = station_id
+        self.meteor_num = meteor_num
+        self.fps = fps
+        self.segments = segments
+        self.dt = filename_to_datetime(ff_filename).replace(tzinfo=timezone.utc)
+        
+        # Calculate start and end offsets
+        if segments:
+            # segments format: [Frame#, Col, Row, RA, Dec, Azim, Elev, Inten, Mag]
+            self.start_frame = segments[0][0]
+            self.end_frame = segments[-1][0]
+            self.start_offset = self.start_frame / self.fps
+            self.end_offset = self.end_frame / self.fps
+        else:
+            self.start_frame = self.end_frame = 0
+            self.start_offset = self.end_offset = 0
 
-	return n, nt
-
-def getData(ff_path):
-	''' Gets the detections from an FTPdetectinfo file.
-
-	Arguments: Takes the path to the FF files which should also contain the FTPdetectinfo file.
-
-	Returns: A list containing the detection data.
-	'''
-	
-	ftp_dir = findFTPdetectinfoFile(ff_path)
-	# print("ftp:", ftp_dir)
-	ftp_file_list = getFTPdetectinfoFileList(ff_path)
-	# print("ftp list: ", ftp_file_list)
-
-	event_data = []
-
-	if isinstance(ftp_file_list, list):
-		for i in range(len(ftp_file_list)):
-			event_data += readFTPdetectinfo(*os.path.split(ftp_file_list[i]))
-
-	# print("event:", event_data)
-	# event_data += readFTPdetectinfo(*os.path.split(ftp_dir))
-
-	ff_list = [entry[0] for entry in event_data]
-
-	print('No. events: %s' % len(event_data))
-
-	return event_data
-
-def getFTPdetectinfoFileList(path):
-    """ Finds the FTPdetectinfo files in directory if path is a directory, otherwise will return the path """
-
-    if os.path.isfile(path):
-        return path
-
-    ftpdetectinfo_files = [filename for filename in sorted(os.listdir(path)) if 'FTPdetectinfo_' in filename]
-
-    # Remove backup files from list
-    filtered_ftpdetectinfo_files = []
-    for filename in ftpdetectinfo_files:
-        if validDefaultFTPdetectinfo(filename):
-            filtered_ftpdetectinfo_files.append(filename)
-
-    ftpdetectinfo_files = list(filtered_ftpdetectinfo_files)
+def find_nearest_datetime(dt_list: List[datetime], target_dt: datetime) -> Tuple[int, datetime]:
+    """Finds the nearest datetime in a list to the target datetime."""
+    if not dt_list:
+        raise ValueError("The list of datetimes is empty.")
     
-    for i in range(len(ftpdetectinfo_files)):
-	    ftpdetectinfo_files[i] = os.path.join(path, ftpdetectinfo_files[i])
+    diffs = [abs(dt - target_dt).total_seconds() for dt in dt_list]
+    idx = np.argmin(diffs)
+    return idx, dt_list[idx]
+
+def get_ftp_detectinfo_files(path: Path) -> List[Path]:
+    """Finds the FTPdetectinfo files in directory if path is a directory, otherwise returns the path."""
+    if path.is_file():
+        return [path]
+
+    if not path.is_dir():
+        logger.error(f"Path {path} is not a valid file or directory.")
+        return []
+
+    ftp_files = []
+    for f in sorted(path.iterdir()):
+        if f.is_file() and 'FTPdetectinfo_' in f.name and validDefaultFTPdetectinfo(f.name):
+            ftp_files.append(f)
     
-    return ftpdetectinfo_files
+    return ftp_files
 
-    raise FileNotFoundError("FTPdetectinfo file not found")
+def read_detections_from_dir(ff_path_str: str, config) -> List[MeteorDetection]:
+    """Gets the detections from FTPdetectinfo files in the given directory."""
+    ff_path = Path(ff_path_str)
+    ftp_files = get_ftp_detectinfo_files(ff_path)
 
-def videoToVID(video_path, output_path=None):
-	
-	def writeFrame(f, data, time, exptime, seqnum):
-		magic = 809789782
-		seqlen = config.width * config.height * 1
-		headlen = 116
-		flags = 999
-		seq = seqnum
-		ts = int(time) # seconds since epoch
-		tu = int(round((time - ts)*1000000)) # micros since last second
-		num = 1 # station number
-		wid = config.width
-		ht = config.height
-		depth = 8
-		hxt = 0
-		strid = 1
-		res0 = 0
-		expose = exptime
-		res2 = 0
-		desc = 'short description'
+    detections = []
+    for ftp_file in ftp_files:
+        logger.info(f"Reading detection file: {ftp_file}")
+        # readFTPdetectinfo returns a list of detections
+        # Each detection is a list: [ff_name, station_id, meteor_num, ..., segments]
+        file_data = readFTPdetectinfo(str(ftp_file.parent), ftp_file.name)
+        for entry in file_data:
+            det = MeteorDetection(
+                ff_filename=entry[0],
+                station_id=entry[1],
+                meteor_num=entry[2],
+                fps=entry[4] if entry[4] > 0 else config.fps,
+                segments=entry[11]
+            )
+            detections.append(det)
 
-		filler = 0
-		arr = data
-		# arr = arr.astype(np.uint16)
+    logger.info(f"Total detections found: {len(detections)}")
+    return detections
 
-		framenum = seq
-		bkstp = -1 * arr.size * 1
-		# bkstp = -4147200
-		arr.tofile(f)
+def video_to_datetime(video_name: str) -> datetime:
+    """Extracts the datetime from an MKV filename."""
+    # Example filename: CANUCK_20250321_055952_video.mkv
+    parts = video_name.split("_")
+    if len(parts) < 3:
+        raise ValueError(f"Invalid video filename format: {video_name}")
+    date_str = parts[1]
+    time_str = parts[2]
+    return datetime.strptime(f"{date_str} {time_str}", "%Y%m%d %H%M%S").replace(tzinfo=timezone.utc)
 
-		f.seek(bkstp+0, 2)
-		f.write(magic.to_bytes(4,byteorder="little"))
-		f.seek(bkstp+4, 2)
-		f.write(seqlen.to_bytes(4,byteorder="little"))
-		f.seek(bkstp+8, 2)
-		f.write(headlen.to_bytes(4,byteorder="little"))
-		f.seek(bkstp+12, 2)
-		f.write(flags.to_bytes(4,byteorder="little"))
-		f.seek(bkstp+16, 2)
-		f.write(seq.to_bytes(4,byteorder="little"))
-		f.seek(bkstp+20, 2)
-		f.write(ts.to_bytes(4,byteorder="little"))
-		f.seek(bkstp+24, 2)
-		f.write(tu.to_bytes(4,byteorder="little"))
-		f.seek(bkstp+28, 2)
-		f.write(num.to_bytes(2,byteorder="little"))
-		f.seek(bkstp+30, 2)
-		f.write(wid.to_bytes(2,byteorder="little"))
-		f.seek(bkstp+32, 2)
-		f.write(ht.to_bytes(2,byteorder="little"))
-		f.seek(bkstp+34, 2)
-		f.write(depth.to_bytes(2,byteorder="little"))
-		f.seek(bkstp+36, 2)
-		f.write(hxt.to_bytes(4,byteorder="little"))
-		f.seek(bkstp+40, 2)
-		f.write(strid.to_bytes(2,byteorder="little"))
-		f.seek(bkstp+42, 2)
-		f.write(res0.to_bytes(2,byteorder="little"))
-		f.seek(bkstp+44, 2)
-		f.write(expose.to_bytes(4,byteorder="little"))
-		f.seek(bkstp+48, 2)
-		f.write(res2.to_bytes(4,byteorder="little"))
-		f.seek(bkstp+52, 2)
-		f.write(desc.encode("ascii"))
+def video_to_vid(video_path: Path, config, output_path: Optional[Path] = None):
+    """Converts a video file to the RMS .vid format."""
+    
+    def write_frame(f, data, time, exptime, seqnum):
+        magic = 809789782
+        seqlen = config.width * config.height
+        headlen = 116
+        flags = 999
+        ts = int(time)
+        tu = int(round((time - ts) * 1000000))
+        num = 1  # station number
+        
+        # Write image data
+        data.tofile(f)
+        
+        # Write header at the end of the frame (RMS format)
+        bkstp = -1 * data.size
+        f.seek(bkstp, 2)
+        f.write(magic.to_bytes(4, byteorder="little"))
+        f.write(seqlen.to_bytes(4, byteorder="little"))
+        f.write(headlen.to_bytes(4, byteorder="little"))
+        f.write(flags.to_bytes(4, byteorder="little"))
+        f.write(seqnum.to_bytes(4, byteorder="little"))
+        f.write(ts.to_bytes(4, byteorder="little"))
+        f.write(tu.to_bytes(4, byteorder="little"))
+        f.write(num.to_bytes(2, byteorder="little"))
+        f.write(config.width.to_bytes(2, byteorder="little"))
+        f.write(config.height.to_bytes(2, byteorder="little"))
+        f.write((8).to_bytes(2, byteorder="little"))  # depth
+        f.write((0).to_bytes(4, byteorder="little"))  # hxt
+        f.write((1).to_bytes(2, byteorder="little"))  # strid
+        f.write((0).to_bytes(2, byteorder="little"))  # res0
+        f.write(exptime.to_bytes(4, byteorder="little"))
+        f.write((0).to_bytes(4, byteorder="little"))  # res2
+        
+        desc = b'short description'
+        f.write(desc.ljust(64, b'\0'))
+        f.seek(0, 2)
 
-		for i in range(64-len(desc)):
-			f.write(filler.to_bytes(1,byteorder="little"))
-		f.seek(0,2)
+    vid_path = (output_path or video_path.parent) / (video_path.stem + ".vid")
+    start_time = video_to_datetime(video_path.name)
+    frame_time = start_time.timestamp()
+    exposure_time = int(round((1 / config.fps) * 1000))
 
-	dir_path, file_name = os.path.split(video_path)
-	vid_file_name = os.path.basename(video_path).split('.')[0] + ".vid"
+    logger.info(f"Converting {video_path} to {vid_path}")
+    with open(vid_path, "wb") as f:
+        cap = cv2.VideoCapture(str(video_path))
+        frame_index = 0
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            write_frame(f, gray, frame_time, exposure_time, frame_index)
+            frame_index += 1
+            frame_time += exposure_time / 1000
+        cap.release()
 
-	if output_path is not None:
-		vid_file_name = os.path.join(output_path, vid_file_name)
+def video_to_ff_fits(video_path: Path, config, output_path: Optional[Path] = None):
+    """Generates an FF FITS file from a video."""
+    cap = cv2.VideoCapture(str(video_path))
+    frames = []
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+    cap.release()
 
-	# start_time = filenameToDatetime(file_name)
-	start_time = (videoNameToDatetime(file_name)).replace(tzinfo=timezone.utc)
-	frame_time = (start_time - datetime(1970,1,1, tzinfo=timezone.utc)).total_seconds()
-	exposure_time = int(round((1/config.fps)*1000))
+    if not frames:
+        logger.warning(f"No frames found in {video_path}")
+        return
 
-	with open(vid_file_name, "wb") as f:
-		
-		frame_index = 0
+    video = np.stack(frames, axis=0)
+    ff = FFStruct()
+    ff.ncols = config.width
+    ff.nrows = config.height
+    ff.starttime = filename_to_datetime_str(video_path.name)
+    ff.array = np.stack([
+        video.max(axis=0),
+        video.argmax(axis=0),
+        video.mean(axis=0),
+        video.std(axis=0)
+    ], axis=0)
 
-		cap = cv2.VideoCapture(video_path)
-		frames = []
+    out_dir = output_path or (video_path.parent / "FFfiles")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    
+    write_ff_fits(ff, str(out_dir), video_path.stem[:-5] + "0000000")
+    logger.info(f"Wrote FF file to {out_dir}")
 
-		while cap.isOpened():
-			ret, frame = cap.read()
-			if not ret:
-				# print("Can't receive frame")
-				break
-			gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+def cutout_from_mkv(video_path: Path, start_time: datetime, end_time: datetime, camera_id: str, output_dir: Path) -> Optional[Path]:
+    """Cuts out a portion of an MKV file using ffmpeg."""
+    file_time = video_to_datetime(video_path.name)
+    
+    ss = max(0, (start_time - file_time).total_seconds())
+    to = (end_time - file_time).total_seconds()
+    
+    new_file_time_str = start_time.strftime("%Y%m%d_%H%M%S_%f")[:-3] + "A"
+    output_file = output_dir / f"ev_{new_file_time_str}_{camera_id}.mp4"
+    
+    output_file.parent.mkdir(parents=True, exist_ok=True)
 
-			writeFrame(f, gray, frame_time, exposure_time, frame_index)
+    if output_file.exists():
+        logger.info(f"Cutout already exists: {output_file}")
+        return output_file
 
-			frame_index += 1
-			frame_time += exposure_time/1000
-		cap.release()
-
-
-def videoToFF(video_path, output_path=None):
-
-	cap = cv2.VideoCapture(video_path)
-	frames = []
-	while cap.isOpened():
-		ret, frame = cap.read()
-		if not ret:
-			print("Can't receive frame")
-			break
-		gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-		frames.append(gray)
-	cap.release()
-
-	video = np.stack(frames, axis=0)
-
-	maxpixel = video.max(axis=0)
-	avepixel = video.mean(axis=0)
-	stdpixel = video.std(axis=0)
-	maxframe = video.argmax(axis=0)
-
-	dir_path, file_name = os.path.split(video_path)
-
-	ff = FFStruct()
-	ff.ncols = config.width
-	ff.nrows = config.height
-	start_time = filenameToDatetimeStr(file_name)
-	ff.starttime = start_time
-
-	ff.array = np.stack([maxpixel, maxframe, avepixel, stdpixel], axis=0)
-
-	# Write the FF to FITS
-	if output_path is not None:
-		if not os.path.exists(output_path):
-			os.makedirs(output_path)
-	else:
-		output_path = os.path.join(dir_path, "FFfiles")
-		if not os.path.exists(output_path):
-			os.makedirs(output_path)
-
-	output_file_name = file_name.split('.')[0]
-
-	writeFF(ff, output_path, output_file_name[:-5]+"0000000")
-
-	print("Wrote FF file to: ", os.path.join(output_path, output_file_name[:-5], "0000000.fits"))
-
-
-def cutoutFromMKV(video_path, time=None, crop_area=None, type="vid", output_path=None):
-	
-	dir_path, file_name = os.path.split(video_path)
-	# cutout_file_name = os.path.basename(video_path).split('.')[0] + ".vid"
-
-	file_time = videoNameToDatetime(file_name)
-	print(file_time)
-
-	if time is None:
-		start_time = file_time
-		start_frame = 0
-		end_time = None
-		end_frame = None
-	else:
-		start_time = time[0]
-		start_frame = int((start_time - file_time).total_seconds()*config.fps)
-		start_frame_time = int((start_time - file_time).total_seconds())
-		if start_frame < 0:
-			start_frame = 0
-			start_frame_time = 0
-
-		end_time = time[1]
-		end_frame = int((end_time - file_time).total_seconds()*config.fps)
-		end_frame_time = int((end_time - file_time).total_seconds())
-
-		new_file_time = start_time.strftime("%Y%m%d_%H%M%S_%fA")
-
-
-	if config.stationID == "CAWES1":
-		camera_id = "02L"
-	elif config.stationID == "CAWES2":
-		camera_id = "02M"
-
-	output_file = "ev_" + new_file_time + "_" + camera_id + ".mp4"
-	mp4_path = os.path.join("/mnt/RMS_data/dump.vid", camera_id, output_file)
-
-	# print(os.path.join("/mnt/RMS_data/dump.vid", camera_id, output_file))
-	if not os.path.isfile(mp4_path):
-		video_in = ffmpeg.input(video_path, ss=start_frame_time, to=end_frame_time)
-		video_out = ffmpeg.output(video_in, mp4_path)
-		ffmpeg.run(video_out)
-	else:
-		print("Cutout already exists!")
-
-	return mp4_path
-
-
-	# frame_time = (start_time - datetime(1970,1,1, tzinfo=timezone.utc)).total_seconds()
-
-	# cap = cv2.VideoCapture(video_path)
-	# frames = []
-	# while cap.isOpened():
-	# 	ret, frame = cap.read()
-	# 	if not ret:
-	# 		print("Can't receive frame")
-	# 		break
-	# 	gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-		
-	# 	# Crop
-	# 	gray = gray[888-20:888+20, 302-20:302+60]
-	# 	frames.append(gray)
-
-	# cap.release()
-
-	# video = np.stack(frames, axis=0)
-
-	# maxpixel = video.max(axis=0)
-	# avepixel = video.mean(axis=0)
-	# stdpixel = video.std(axis=0)
-	# maxframe = video.argmax(axis=0)
-
-	# plt.imshow(maxpixel)
-	# plt.show()
-
-
-
-def videoNameToDatetime(video_name):
-	year = video_name.split("_")[1]
-	time = video_name.split("_")[2]
-
-	return (datetime.strptime(year + " " + time, "%Y%m%d %H%M%S")).replace(tzinfo=timezone.utc)
+    logger.info(f"Cutting {video_path} from {ss}s to {to}s -> {output_file}")
+    try:
+        (
+            ffmpeg
+            .input(str(video_path), ss=ss, to=to)
+            .output(str(output_file))
+            .run(quiet=True, overwrite_output=True)
+        )
+        return output_file
+    except ffmpeg.Error as e:
+        logger.error(f"FFmpeg error: {e.stderr.decode() if e.stderr else str(e)}")
+        return None
 
 
 if __name__=="__main__":
@@ -361,8 +277,6 @@ if __name__=="__main__":
 	video_list.sort()
 	video_datetime_list = []
 
-	# print(video_list)
-
 	for i in range(len(video_list)):
 		video_name = os.path.basename(video_list[i])
 		video_datetime_list.append(videoNameToDatetime(video_name))
@@ -382,9 +296,6 @@ if __name__=="__main__":
 	cut_start = []
 	cut_end = []
 	cut_mp4_list = []
-
-	print(video_datetime_list)
-	# print(ff_datetime[0])
 
 	for i in range(len(ff_datetime)):
 		n, nt = nearestDatetime(video_datetime_list, ff_datetime[i])
@@ -411,57 +322,3 @@ if __name__=="__main__":
 			cut_mp4_list.append(cutoutFromMKV(video_list[n], [cut_start[-1], cut_end[-1]]))
 
 
-	# if config.stationID == "CAWES1":
-	# 	camera_id = "02L"
-	# elif config.stationID == "CAWES2":
-	# 	camera_id = "02M"
-
-	# # cut_MKV_list = glob.glob(os.path.join("/mnt/RMS_data/dump.vid", camera_id, "*.mp4"))
-	# # cut_MKV_list.sort()
-
-	# for mp4 in cut_mp4_list:
-	# 	videoToVID(mp4, os.path.join("/mnt/RMS_data/dump.vid", camera_id))
-
-
-	# print(cut_mp4_list)
-	
-	# print(videos_to_archive)
-	# 	# print(ftp_data[i][11][0][9])
-
-	
-
-
-	# for video in videos_to_archive:
-	# 	if os.path.isfile(video):
-
-	# 		print(os.path.exists(os.path.join("/mnt/RMS_data/dump.vid", os.path.basename(video).removesuffix(".mkv") + ".vid")))
-
-	# 		if not os.path.exists(os.path.join("/mnt/RMS_data/dump.vid", os.path.basename(video).removesuffix(".mkv") + ".vid")):
-	# 			videoToVID(video, output_path="/mnt/RMS_data/dump.vid")
-	# 			print("Converted to VID...")
-	# 		else:
-	# 			print("File already exists...")
-
-
-
-	# print(ff_filenames)
-
-	# event_data = getData(ftp_dir)
-
-	# # video_dir
-	# print(os.path.join(config.data_dir, config.video_dir))
-
-	# print(event_data)
-
-	# if os.path.isdir(vid_path):
-	# 	print("Directory")
-	# 	video_list = glob.glob(os.path.join(vid_path, "*.mkv"))
-	# 	for i in range(len(video_list)):
-	# 		# videoToFF(video_list[i])
-	# 		videoToVID(video_list[i])
-	# elif os.path.isfile(vid_path):
-	# 	# videoToFF(vid_path)
-	# 	# videoToVID(vid_path)
-	# 	cutoutFromMKV(vid_path)
-	# else:
-	# 	print("Somthing went wrong.")
