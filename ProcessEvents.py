@@ -1,384 +1,285 @@
-# Process CAMO and EMCCD events
-# rsync and parse corr.txt files from /srv/meteor/klingon/events
-
-import glob, os
-import numpy as np
-import pandas as pd
-import ffmpeg
+import argparse
+import cv2
+import glob
+import os
+import shutil
+import logging
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import List, Optional, Tuple, Dict
 
-def nearestDatetime(dt_list, ntime):
-	time_diff = np.abs([date - ntime for date in dt_list])
-	nt = min(dt_list, key=lambda x:abs(x - ntime))
-	n = time_diff.argmin(0)
-	return n, nt
+import ffmpeg
+import numpy as np
+import RMS.ConfigReader as cr
+from RMS.Formats.FFfits import write as write_ff_fits
+from RMS.Formats.FFfits import filenameToDatetimeStr as filename_to_datetime_str
+from RMS.Formats.FFfile import filenameToDatetime as filename_to_datetime
+from RMS.Formats.FFStruct import FFStruct
 
-def MKVNameToDatetime(mkv_filepath):
-	mkv_name = os.path.basename(mkv_filepath)
-	name_split = mkv_name.split("_")
-	camera_name = name_split[0]
-	date = name_split[1]
-	hms_time = name_split[2]
-	millis_time = name_split[3]
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-	mkv_datetime = datetime.strptime(date + " " + hms_time, "%Y%m%d %H%M%S").replace(tzinfo=timezone.utc)
+class EventDetection:
+	def __init__(self, dt: datetime, source_file: str, line: Optional[str] = None):
+		self.dt = dt
+		self.source_file = source_file
+		self.line = line
 
-	if millis_time.isnumeric():
-		print("Milliseconds are in the filename.")
-		millis_time = int(millis_time)
-		mkv_datetime = mkv_datetime + timedelta(milliseconds=millis_time)
-	else:
-		print("This file name does not have millis...")
-		millis_time = 0
-
-	return camera_name, mkv_datetime
-
-def videoNameToDatetime(video_name):
-	year = video_name.split("_")[1]
-	time = video_name.split("_")[2]
-
-	return (datetime.strptime(year + " " + time, "%Y%m%d %H%M%S")).replace(tzinfo=timezone.utc)
-
-def cutoutFromMKV(video_path, file_time, time=None, crop_area=None, type="vid", output_path=None):
+def find_nearest_datetime(dt_list: List[datetime], target_dt: datetime) -> Tuple[int, datetime]:
+	"""Finds the nearest datetime in a list to the target datetime."""
+	if not dt_list:
+		raise ValueError("The list of datetimes is empty.")
 	
-	dir_path, file_name = os.path.split(video_path)
-	# cutout_file_name = os.path.basename(video_path).split('.')[0] + ".vid"
+	diffs = [abs(dt - target_dt).total_seconds() for dt in dt_list]
+	idx = np.argmin(diffs)
+	return idx, dt_list[idx]
 
-	# file_time = videoNameToDatetime(file_name)
+def video_to_datetime(video_name: str) -> datetime:
+	"""Extracts the datetime from an MKV filename."""
+	parts = video_name.split("_")
+	if len(parts) < 3:
+		raise ValueError(f"Invalid video filename format: {video_name}")
+	date_str = parts[1]
+	time_str = parts[2]
+	dt = datetime.strptime(f"{date_str} {time_str}", "%Y%m%d %H%M%S").replace(tzinfo=timezone.utc)
+	# Handle potential milliseconds (e.g., STATION_YYYYMMDD_HHMMSS_mmm_video.mkv)
+	if len(parts) > 3 and parts[3].isdigit():
+		dt += timedelta(milliseconds=int(parts[3]))
+	return dt
 
-	# print(file_time)
+def parse_ev_filename(file_path: Path) -> Optional[EventDetection]:
+	"""Parses the datetime from an ev_*.txt filename."""
+	try:
+		parts = file_path.name.split("_")
+		if len(parts) < 3:
+			return None
+		date_str = parts[1]
+		time_str = parts[2]
+		dt = datetime.strptime(f"{date_str} {time_str}", "%Y%m%d %H%M%S").replace(tzinfo=timezone.utc)
+		return EventDetection(dt, str(file_path))
+	except ValueError:
+		return None
 
-	if time is None:
-		start_time = file_time
-		start_frame = 0
-		end_time = None
-		end_frame = None
-	else:
-		start_time = time[0]
-		start_frame = int((start_time - file_time).total_seconds()*mkv_fps)
-		start_frame_time = int((start_time - file_time).total_seconds())
-		if start_frame < 0:
-			start_frame = 0
-			start_frame_time = 0
+def parse_corr_file(file_path: Path) -> List[EventDetection]:
+	"""Parses events from a corr.txt file."""
+	events = []
+	logger.info(f"Parsing corr file: {file_path}")
+	try:
+		with open(file_path, 'r') as f:
+			for line in f:
+				line = line.strip()
+				if line.startswith("+") or line.startswith("%"):
+					parts = line.split()
+					if len(parts) < 3:
+						continue
+					date_str = parts[1]
+					time_str = parts[2]
+					try:
+						# Expecting YYYYMMDD HH:MM:SS
+						dt = datetime.strptime(f"{date_str} {time_str}", "%Y%m%d %H:%M:%S").replace(tzinfo=timezone.utc)
+						events.append(EventDetection(dt, str(file_path), line))
+					except ValueError:
+						continue
+	except Exception as e:
+		logger.error(f"Error reading {file_path}: {e}")
+	return events
 
-		end_time = time[1]
-		end_frame = int((end_time - file_time).total_seconds()*mkv_fps)
-		end_frame_time = int((end_time - file_time).total_seconds())
-
-		new_file_time = start_time.strftime("%Y%m%d_%H%M%S_%fA")
-
-
-	if stationID == "CAWES1":
-		camera_id = "02L"
-	elif stationID == "CAWES2":
-		camera_id = "02M"
-
-	output_file = "ev_" + new_file_time + "_" + camera_id + ".mp4"
-	mp4_path = os.path.join(out_path, camera_id, output_file)
-
-	# print(os.path.join("/mnt/RMS_data/dump.vid", camera_id, output_file))
-	if not os.path.isfile(mp4_path):
-		video_in = ffmpeg.input(video_path, ss=start_frame_time, to=end_frame_time)
-		video_out = ffmpeg.output(video_in, mp4_path)
-		ffmpeg.run(video_out)
-	else:
-		print("Cutout already exists!")
-
-	return mp4_path
-
-def videoToVID(video_path, output_path=None):
+def video_to_vid(video_path: Path, config, output_path: Optional[Path] = None):
+	"""Converts a video file to the RMS .vid format."""
 	
-	def writeFrame(f, data, time, exptime, seqnum):
+	def write_frame(f, data, time, exptime, seqnum):
 		magic = 809789782
-		seqlen = config.width * config.height * 1
+		seqlen = config.width * config.height
 		headlen = 116
 		flags = 999
-		seq = seqnum
-		ts = int(time) # seconds since epoch
-		tu = int(round((time - ts)*1000000)) # micros since last second
+		ts = int(time)
+		tu = int(round((time - ts) * 1000000))
 		num = 1 # station number
-		wid = config.width
-		ht = config.height
-		depth = 8
-		hxt = 0
-		strid = 1
-		res0 = 0
-		expose = exptime
-		res2 = 0
-		desc = 'short description'
-
-		filler = 0
-		arr = data
-		# arr = arr.astype(np.uint16)
-
-		framenum = seq
-		bkstp = -1 * arr.size * 1
-		# bkstp = -4147200
-		arr.tofile(f)
-
-		f.seek(bkstp+0, 2)
-		f.write(magic.to_bytes(4,byteorder="little"))
-		f.seek(bkstp+4, 2)
-		f.write(seqlen.to_bytes(4,byteorder="little"))
-		f.seek(bkstp+8, 2)
-		f.write(headlen.to_bytes(4,byteorder="little"))
-		f.seek(bkstp+12, 2)
-		f.write(flags.to_bytes(4,byteorder="little"))
-		f.seek(bkstp+16, 2)
-		f.write(seq.to_bytes(4,byteorder="little"))
-		f.seek(bkstp+20, 2)
-		f.write(ts.to_bytes(4,byteorder="little"))
-		f.seek(bkstp+24, 2)
-		f.write(tu.to_bytes(4,byteorder="little"))
-		f.seek(bkstp+28, 2)
-		f.write(num.to_bytes(2,byteorder="little"))
-		f.seek(bkstp+30, 2)
-		f.write(wid.to_bytes(2,byteorder="little"))
-		f.seek(bkstp+32, 2)
-		f.write(ht.to_bytes(2,byteorder="little"))
-		f.seek(bkstp+34, 2)
-		f.write(depth.to_bytes(2,byteorder="little"))
-		f.seek(bkstp+36, 2)
-		f.write(hxt.to_bytes(4,byteorder="little"))
-		f.seek(bkstp+40, 2)
-		f.write(strid.to_bytes(2,byteorder="little"))
-		f.seek(bkstp+42, 2)
-		f.write(res0.to_bytes(2,byteorder="little"))
-		f.seek(bkstp+44, 2)
-		f.write(expose.to_bytes(4,byteorder="little"))
-		f.seek(bkstp+48, 2)
-		f.write(res2.to_bytes(4,byteorder="little"))
-		f.seek(bkstp+52, 2)
-		f.write(desc.encode("ascii"))
-
-		for i in range(64-len(desc)):
-			f.write(filler.to_bytes(1,byteorder="little"))
-		f.seek(0,2)
-
-	dir_path, file_name = os.path.split(video_path)
-	vid_file_name = os.path.basename(video_path).split('.')[0] + ".vid"
-
-	if output_path is not None:
-		vid_file_name = os.path.join(output_path, vid_file_name)
-
-	# start_time = filenameToDatetime(file_name)
-	start_time = (videoNameToDatetime(file_name)).replace(tzinfo=timezone.utc)
-	frame_time = (start_time - datetime(1970,1,1, tzinfo=timezone.utc)).total_seconds()
-	exposure_time = int(round((1/config.fps)*1000))
-
-	with open(vid_file_name, "wb") as f:
 		
+		f.write(data.tobytes())
+		
+		bkstp = -1 * data.size
+		f.seek(bkstp, 2)
+		f.write(magic.to_bytes(4, byteorder="little"))
+		f.write(seqlen.to_bytes(4, byteorder="little"))
+		f.write(headlen.to_bytes(4, byteorder="little"))
+		f.write(flags.to_bytes(4, byteorder="little"))
+		f.write(seqnum.to_bytes(4, byteorder="little"))
+		f.write(ts.to_bytes(4, byteorder="little"))
+		f.write(tu.to_bytes(4, byteorder="little"))
+		f.write(num.to_bytes(2, byteorder="little"))
+		f.write(config.width.to_bytes(2, byteorder="little"))
+		f.write(config.height.to_bytes(2, byteorder="little"))
+		f.write((8).to_bytes(2, byteorder="little")) # depth
+		f.write((0).to_bytes(4, byteorder="little")) # hxt
+		f.write((1).to_bytes(2, byteorder="little")) # strid
+		f.write((0).to_bytes(2, byteorder="little")) # res0
+		f.write(exptime.to_bytes(4, byteorder="little"))
+		f.write((0).to_bytes(4, byteorder="little")) # res2
+		
+		desc = b'event cutout'
+		f.write(desc.ljust(64, b'\0'))
+		f.seek(0, 2)
+
+	vid_path = (output_path or video_path.parent) / (video_path.stem + ".vid")
+	try:
+		start_time = video_to_datetime(video_path.name)
+	except ValueError:
+		start_time = datetime.now(timezone.utc)
+	
+	frame_time = start_time.timestamp()
+	exposure_time = int(round((1 / config.fps) * 1000))
+
+	logger.info(f"Converting {video_path} to {vid_path}")
+	with open(vid_path, "wb") as f:
+		cap = cv2.VideoCapture(str(video_path))
 		frame_index = 0
-
-		cap = cv2.VideoCapture(video_path)
-		frames = []
-
 		while cap.isOpened():
 			ret, frame = cap.read()
 			if not ret:
-				# print("Can't receive frame")
 				break
 			gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-			writeFrame(f, gray, frame_time, exposure_time, frame_index)
-
+			write_frame(f, gray, frame_time, exposure_time, frame_index)
 			frame_index += 1
-			frame_time += exposure_time/1000
+			frame_time += exposure_time / 1000
 		cap.release()
 
-if __name__ == "__main__":
+def cutout_from_mkv(video_path: Path, start_time: datetime, end_time: datetime, camera_id: str, output_dir: Path) -> Optional[Path]:
+	"""Cuts out a portion of an MKV file using ffmpeg."""
+	try:
+		file_time = video_to_datetime(video_path.name)
+	except ValueError as e:
+		logger.error(f"Could not parse datetime from {video_path.name}: {e}")
+		return None
 	
-	data_paths = ["/mnt/RMS_data/CAWES1/CapturedFiles", "/mnt/RMS_data/CAWES2/CapturedFiles"]
-	mkv_path = ["/mnt/RMS_data/CAWES1/VideoFiles", "/mnt/RMS_data/CAWES2/VideoFiles"]
-	event_path = "/srv/meteor/klingon/events"
-	out_path = "/mnt/RMS_data/dump.vid/Test"
+	ss = max(0, (start_time - file_time).total_seconds())
+	to = (end_time - file_time).total_seconds()
+	
+	new_file_time_str = start_time.strftime("%Y%m%d_%H%M%S_%f")[:-3] + "A"
+	output_file = output_dir / f"ev_{new_file_time_str}_{camera_id}.mp4"
+	
+	output_file.parent.mkdir(parents=True, exist_ok=True)
 
-	mkv_length = 30
-	mkv_fps = 25
-	buffer = 2
-	meteor_length = 3
+	if output_file.exists():
+		logger.info(f"Cutout already exists: {output_file}")
+		return output_file
 
-	# Get list of dates to process from dates of data currently saved in data directory
-	dates = []
-	for data_path in data_paths:
-		dlist = glob.glob(os.path.join(data_path, "*"))
-		for j in range(len(dlist)):
-			dates.append(os.path.basename(dlist[j]).split("_")[1])
+	logger.info(f"Cutting {video_path} from {ss:.2f}s to {to:.2f}s -> {output_file}")
+	try:
+		(
+			ffmpeg
+			.input(str(video_path), ss=ss, to=to)
+			.output(str(output_file))
+			.run(quiet=True, overwrite_output=True)
+		)
+		return output_file
+	except ffmpeg.Error as e:
+		logger.error(f"FFmpeg error: {e.stderr.decode() if e.stderr else str(e)}")
+		return None
 
-	dates = list(set(dates))
-	dates.sort()
+def main():
+	arg_parser = argparse.ArgumentParser(description="Process meteor events and create MKV cutouts.")
+	arg_parser.add_argument('config', help='Path to the RMS config file.')
+	arg_parser.add_argument('-e', '--events', help='Path to events directory, ev_*.txt, or corr.txt file.')
+	arg_parser.add_argument('--mkv-paths', nargs='+', help='List of directories containing MKV files.')
+	arg_parser.add_argument('--output-dir', help='Directory to save cutouts (default: /mnt/RMS_data/dump.vid/Test).')
+	arg_parser.add_argument('--buffer', type=float, default=2.0, help='Buffer before/after event in seconds (default: 2.0).')
+	arg_parser.add_argument('--length', type=float, default=3.0, help='Assumed meteor duration in seconds (default: 3.0).')
+	arg_parser.add_argument('--camera-id', help='Override camera ID. If not provided, will try to infer.')
+	arg_parser.add_argument('--convert-vid', action='store_true', help='Convert the resulting MP4 cutouts to .vid format.')
 
-	# List of videos found in the MKV path(s)
-	video_list = glob.glob(os.path.join(mkv_path[0], "**/*.mkv"), recursive=True)
-	video_list2 = glob.glob(os.path.join(mkv_path[1], "**/*.mkv"), recursive=True)
+	args = arg_parser.parse_args()
 
-	video_list.sort()
-	video_list2.sort()
+	# Load configuration
+	config = cr.loadConfigFromDirectory(args.config, os.path.abspath("."))
+	logger.info("Loaded configuration successfully!")
 
-	# Make a list of the datetimes of the videos
-	video_datetime_list = []
-	video_datetime_list2 = []
+	# Resolve event path
+	event_root = Path(args.events) if args.events else Path("/srv/meteor/klingon/events")
+	all_events = []
 
-	for i in range(len(video_list)):
-		video_name = os.path.basename(video_list[i])
-		video_datetime_list.append(videoNameToDatetime(video_name))
-
-	for i in range(len(video_list2)):
-		video_name2 = os.path.basename(video_list2[i])
-		video_datetime_list2.append(videoNameToDatetime(video_name2))
-
-
-
-	# Make a list of the events listed on Colossid
-	event_dirs = []
-	for date in dates:
-		event_dirs.append(os.path.join(event_path, date))
-
-	# Make a list of the datetimes of all of the events, for the dates specified
-	event_datetime_list = []
-	for event_dir in event_dirs:
-		ev_file_list = glob.glob(os.path.join(event_dir, "ev*02T.txt"))
-		ev_file_list.sort()
-		for ev_file in ev_file_list:
-			ev_file_split = ev_file.split("_")
-			year = ev_file_split[1][:4]
-			month = ev_file_split[1][4:6]
-			day = ev_file_split[1][6:]
-			hour = ev_file_split[2][:2]
-			minute = ev_file_split[2][2:4]
-			second = ev_file_split[2][4:6]
-
-			event_datetime_list.append(datetime(int(year), int(month), int(day), int(hour), int(minute), int(second), tzinfo=timezone.utc))
-
-	# Loop over the datetimes for the events, and make the cutouts
-	videos_to_archive = []
-	event_archive_times = []
-	videos_to_archive2 = []
-	event_archive_times2 = []
-	cut_start = []
-	cut_end = []
-	cut_start2 = []
-	cut_end2 = []
-	cut_mp4_list = []
-
-	for i in range(len(event_datetime_list)):
-		try:
-			n, nt = nearestDatetime(video_datetime_list, event_datetime_list[i])
-			# print(n, nt)
-		except:
-			print("Didna work.")
-		
-		td = (event_datetime_list[i]-nt).total_seconds()
-
-		if td < 0:
-			n -= 1
-		if td > 0 and td < 30:
-			# print(td)
-			videos_to_archive.append(video_list[n])
-			event_archive_times.append(event_datetime_list[i])
-
-	for i in range(len(event_datetime_list)):
-		try:
-			n2, nt2 = nearestDatetime(video_datetime_list2, event_datetime_list[i])
-			# print(n, nt)
-		except:
-			print("Didna work.")
-		
-		td2 = (event_datetime_list[i]-nt2).total_seconds()
-
-		if td2 < 0:
-			n2 -= 1
-		if td2 > 0 and td2 < 30:
-			# print(td)
-			videos_to_archive2.append(video_list2[n2])
-			event_archive_times2.append(event_datetime_list[i])
-
-	for i in range(len(videos_to_archive)):
-		stationID, mkv_time = MKVNameToDatetime(videos_to_archive[i])
-
-		time_diff = event_archive_times[i] - mkv_time
-
-		if time_diff.total_seconds() > buffer:
-			start_offset = time_diff.total_seconds() - buffer
+	if event_root.is_file() and event_root.suffix == ".txt":
+		if "corr" in event_root.name.lower():
+			all_events.extend(parse_corr_file(event_root))
 		else:
-			start_offset = 0
+			ev = parse_ev_filename(event_root)
+			if ev: all_events.append(ev)
+	elif event_root.is_dir():
+		for f in sorted(event_root.rglob("*")):
+			if f.is_file():
+				if "corr.txt" in f.name.lower():
+					all_events.extend(parse_corr_file(f))
+				elif f.name.startswith("ev") and f.suffix == ".txt":
+					ev = parse_ev_filename(f)
+					if ev: all_events.append(ev)
 
-		if time_diff.total_seconds() < (mkv_length - (buffer + meteor_length)):
-			end_offset = time_diff.total_seconds() + (buffer + meteor_length)
-		else:
-			end_offset = mkv_length
+	if not all_events:
+		logger.warning(f"No events found in {event_root}")
+		return
 
-		cut_frame_start = event_archive_times[i] + timedelta(seconds=start_offset)
-		cut_frame_end = event_archive_times[i] + timedelta(seconds= end_offset)
+	logger.info(f"Unique events to process: {len(all_events)}")
 
-		cut_start.append(cut_frame_start)
-		cut_end.append(cut_frame_end)
-		cut_mp4_list.append(cutoutFromMKV(videos_to_archive[i], mkv_time, [cut_start[-1], cut_end[-1]]))
+	# Resolve MKV paths
+	mkv_roots = [Path(p) for p in args.mkv_paths] if args.mkv_paths else [
+		Path("/mnt/RMS_data/CAWES1/VideoFiles"),
+		Path("/mnt/RMS_data/CAWES2/VideoFiles")
+	]
 
-	for i in range(len(videos_to_archive2)):
-		stationID, mkv_time = MKVNameToDatetime(videos_to_archive2[i])
+	mkv_indices = []
+	for root in mkv_roots:
+		if not root.exists():
+			logger.warning(f"MKV root does not exist: {root}")
+			continue
+		files = sorted(list(root.rglob("*.mkv")))
+		dts = []
+		valid_files = []
+		for f in files:
+			try:
+				dts.append(video_to_datetime(f.name))
+				valid_files.append(f)
+			except ValueError:
+				continue
+		if valid_files:
+			mkv_indices.append({'root': root, 'files': valid_files, 'datetimes': dts})
 
-		time_diff = event_archive_times2[i] - mkv_time
+	if not mkv_indices:
+		logger.error("No valid MKV files found in any of the specified paths.")
+		return
 
-		if time_diff.total_seconds() > buffer:
-			start_offset = time_diff.total_seconds() - buffer
-		else:
-			start_offset = 0
+	output_dir_base = Path(args.output_dir) if args.output_dir else Path("/mnt/RMS_data/dump.vid/Test")
 
-		if time_diff.total_seconds() < (mkv_length - (buffer + meteor_length)):
-			end_offset = time_diff.total_seconds() + (buffer + meteor_length)
-		else:
-			end_offset = mkv_length
+	processed_count = 0
+	for event in all_events:
+		for index in mkv_indices:
+			try:
+				idx, mkv_dt = find_nearest_datetime(index['datetimes'], event.dt)
+				if event.dt < mkv_dt and idx > 0:
+					idx -= 1
+					mkv_dt = index['datetimes'][idx]
+				
+				m_video = index['files'][idx]
+				time_diff = (event.dt - mkv_dt).total_seconds()
+				
+				if 0 <= time_diff < 120:
+					start_cut = max(mkv_dt, event.dt - timedelta(seconds=args.buffer))
+					end_cut = event.dt + timedelta(seconds=args.buffer + args.length)
+					
+					current_camera_id = args.camera_id
+					if not current_camera_id:
+						current_camera_id = "02L" if "CAWES1" in str(index['root']) else "02M" if "CAWES2" in str(index['root']) else "UNK"
 
-		cut_frame_start = event_archive_times2[i] + timedelta(seconds=start_offset)
-		cut_frame_end = event_archive_times2[i] + timedelta(seconds= end_offset)
+					out_path = output_dir_base / current_camera_id
+					mp4_path = cutout_from_mkv(m_video, start_cut, end_cut, current_camera_id, out_path)
+					
+					if mp4_path:
+						processed_count += 1
+						if args.convert_vid:
+							video_to_vid(mp4_path, config, out_path)
+			except Exception as e:
+				logger.error(f"Error matching event {event.dt} in {index['root']}: {e}")
 
-		cut_start2.append(cut_frame_start)
-		cut_end2.append(cut_frame_end)
-		print(cut_start2[-1], cut_end2[-1])
-		try:
-			cut_mp4_list.append(cutoutFromMKV(videos_to_archive2[i], mkv_time, [cut_start2[-1], cut_end2[-1]]))
-		except:
-			print("Couldn't make mp4...")
+	logger.info(f"Processing complete. {processed_count} cutouts created.")
 
-		# print(cut_frame_start, cut_frame_end)
-	# print(cut_mp4_list)
-	# print(cut_start)
-	# print(video_archive_times[-1], videos_to_archive[-1])
-
-
-	# remote_ip = "10.24.8."
-	# for i in range(len(dates)):
-	# 	# scp optical@colossid.localnet:/blah/blah/meteor/klingon/evcorr/date/corr.txt /path/to/save/date+camo+corr.txt
-	# 	# scp optical@colossid.localnet:/blah/blah/meteor/klingon/evcorr/date/corr.txt /path/to/save/date+emccd+corr.txt
-
-	# 	os.system()
-
-	# Open and parse corr.txt files
-	# ev_date = []
-	# ev_time = []
-	# ev_stations = []
-	# ev_vel = []
-	# ev_mass = []
-	# ev_beg = []
-	# ev_end = []
-
-	corr_filenames = ["20250618_emccd_corr.txt"]
-
-	# for i in len(corr_filenames):
-	# 	with open(corr_filenames[i]) as f:
-	# 		for line in f:
-	# 			if line.startswith("+") or line.startswith("%"):
-	# 				line_split = line.split(" ")
-	# 				ev_date.append(line_split[1])
-	# 				ev_time.append(line_split[2])
-	# 				ev_stations.append([line_split[4],line_split[5],line_split[6],line_split[7]])
-	# 				ev_vel.append(line_split[9])
-	# 				ev_mass.append(line_split[10])
-	# 				ev_beg.append(line_split[11])
-	# 				ev_end.append(line_split[12])
-	# 				# print(line.split(" "))
-
-	# 	column_names = ["date", "time", "stations", "vel", "mass", "beg", "end"]
-	# 	ev_df = pd.DataFrame(list(zip(ev_date, ev_time, ev_stations, ev_vel, ev_mass, ev_beg, ev_end)), columns=column_names)
-	# 	print(ev_df)
+if __name__ == "__main__":
+	main()
