@@ -4,6 +4,7 @@ import glob
 import os
 import shutil
 import logging
+import subprocess
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict
@@ -220,6 +221,21 @@ def cutout_from_mkv(video_path: Path, start_time: datetime, end_time: datetime, 
 		logger.error(f"FFmpeg error: {e.stderr.decode() if e.stderr else str(e)}")
 		return None
 
+def sync_to_remote(local_dir: Path, remote_path: str):
+	"""Syncs the local directory to a remote path using rsync."""
+	logger.info(f"Syncing {local_dir} to {remote_path}...")
+	try:
+		# -a: archive mode, -v: verbose, -z: compress, --progress: show progress
+		# We use shlex.split or just a list for safety
+		cmd = ["rsync", "-avz", str(local_dir) + "/", remote_path]
+		result = subprocess.run(cmd, capture_output=True, text=True)
+		if result.returncode == 0:
+			logger.info("Rsync completed successfully.")
+		else:
+			logger.error(f"Rsync failed with return code {result.returncode}: {result.stderr}")
+	except Exception as e:
+		logger.error(f"Error during rsync: {e}")
+
 def main():
 	arg_parser = argparse.ArgumentParser(description="Convert MKV meteor detections to cutout videos.")
 	arg_parser.add_argument('config', help='Path to the RMS config file or directory.')
@@ -228,6 +244,7 @@ def main():
 	arg_parser.add_argument('--output-dir', help='Directory to save cutouts (default: /mnt/RMS_data/dump.vid).')
 	arg_parser.add_argument('--camera-id', help='Camera ID for filename (e.g., 02L). If not provided, will try to infer from station ID.')
 	arg_parser.add_argument('--convert-vid', action='store_true', help='Convert the resulting MP4 cutouts to .vid format.')
+	arg_parser.add_argument('--rsync-path', help='Remote path to rsync the cutouts to (e.g., user@host:/path/to/dest).')
 
 	args = arg_parser.parse_args()
 
@@ -320,6 +337,10 @@ def main():
 			logger.error(f"Error processing detection {det.ff_filename}: {e}", exc_info=True)
 
 	logger.info(f"Processing complete. {processed_count} cutouts created in {output_dir}")
+
+	# Sync to remote if requested
+	if args.rsync_path:
+		sync_to_remote(output_dir, args.rsync_path)
 
 if __name__ == "__main__":
 	main()
