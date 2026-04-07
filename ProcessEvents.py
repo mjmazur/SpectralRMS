@@ -5,9 +5,13 @@ import os
 import shutil
 import logging
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict
+
+from tqdm import tqdm
 
 import ffmpeg
 import numpy as np
@@ -211,6 +215,8 @@ def main():
 	print(args.config)
 	config = cr.loadConfigFromDirectory([args.config], os.path.abspath("."))
 	logger.info("Loaded configuration successfully!")
+	print(f"  Station ID : {getattr(config, 'stationID', 'N/A')}")
+	print(f"  Resolution : {getattr(config, 'width', '?')}x{getattr(config, 'height', '?')} @ {getattr(config, 'fps', '?')} fps")
 
 	# Resolve event path
 	event_root = Path(args.events) if args.events else Path("/srv/meteor/klingon/events")
@@ -223,13 +229,13 @@ def main():
 			ev = parse_ev_filename(event_root)
 			if ev: all_events.append(ev)
 	elif event_root.is_dir():
-		for f in sorted(event_root.rglob("*")):
-			if f.is_file():
-				if "corr.txt" in f.name.lower():
-					all_events.extend(parse_corr_file(f))
-				elif f.name.startswith("ev") and f.suffix == ".txt":
-					ev = parse_ev_filename(f)
-					if ev: all_events.append(ev)
+		all_txt = sorted([f for f in event_root.rglob("*") if f.is_file() and f.suffix == ".txt"])
+		for f in tqdm(all_txt, desc="Scanning event files", unit="file"):
+			if "corr.txt" in f.name.lower():
+				all_events.extend(parse_corr_file(f))
+			elif f.name.startswith("ev"):
+				ev = parse_ev_filename(f)
+				if ev: all_events.append(ev)
 
 	if not all_events:
 		logger.warning(f"No events found in {event_root}")
@@ -243,22 +249,28 @@ def main():
 		Path("/mnt/RMS_data/CAWES2/VideoFiles")
 	]
 
-	mkv_indices = []
-	for root in mkv_roots:
+	def _index_mkv_root(root: Path) -> Optional[Dict]:
 		if not root.exists():
 			logger.warning(f"MKV root does not exist: {root}")
-			continue
+			return None
 		files = sorted(list(root.rglob("*.mkv")))
-		dts = []
-		valid_files = []
-		for f in files:
+		dts, valid_files = [], []
+		for f in tqdm(files, desc=f"Indexing {root.name}", unit="file", leave=False):
 			try:
 				dts.append(video_to_datetime(f.name))
 				valid_files.append(f)
 			except ValueError:
 				continue
-		if valid_files:
-			mkv_indices.append({'root': root, 'files': valid_files, 'datetimes': dts})
+		return {'root': root, 'files': valid_files, 'datetimes': dts} if valid_files else None
+
+	mkv_indices = []
+	with ThreadPoolExecutor(max_workers=len(mkv_roots) or 1) as pool:
+		futures = {pool.submit(_index_mkv_root, root): root for root in mkv_roots}
+		for fut in tqdm(as_completed(futures), total=len(futures), desc="Indexing MKV roots", unit="root"):
+			result = fut.result()
+			if result:
+				mkv_indices.append(result)
+				logger.info(f"Indexed {len(result['files'])} MKV files from {result['root']}")
 
 	if not mkv_indices:
 		logger.error("No valid MKV files found in any of the specified paths.")
@@ -267,34 +279,49 @@ def main():
 	output_dir_base = Path(args.output_dir) if args.output_dir else Path("/mnt/RMS_data/dump.vid/Test")
 
 	processed_count = 0
-	for event in all_events:
+	count_lock = threading.Lock()
+
+	def _process_event(event: EventDetection) -> int:
+		"""Processes a single event across all MKV indices. Returns number of cutouts created."""
+		local_count = 0
 		for index in mkv_indices:
 			try:
 				idx, mkv_dt = find_nearest_datetime(index['datetimes'], event.dt)
 				if event.dt < mkv_dt and idx > 0:
 					idx -= 1
 					mkv_dt = index['datetimes'][idx]
-				
+
 				m_video = index['files'][idx]
 				time_diff = (event.dt - mkv_dt).total_seconds()
-				
+
 				if 0 <= time_diff < 120:
 					start_cut = max(mkv_dt, event.dt - timedelta(seconds=args.buffer))
 					end_cut = event.dt + timedelta(seconds=args.buffer + args.length)
-					
+
 					current_camera_id = args.camera_id
 					if not current_camera_id:
 						current_camera_id = "02L" if "CAWES1" in str(index['root']) else "02M" if "CAWES2" in str(index['root']) else "UNK"
 
 					out_path = output_dir_base / current_camera_id
 					mp4_path = cutout_from_mkv(m_video, start_cut, end_cut, current_camera_id, out_path)
-					
+
 					if mp4_path:
-						processed_count += 1
+						local_count += 1
 						if args.convert_vid:
 							video_to_vid(mp4_path, config, out_path)
 			except Exception as e:
 				logger.error(f"Error matching event {event.dt} in {index['root']}: {e}")
+		return local_count
+
+	max_workers = min(8, len(all_events))
+	with ThreadPoolExecutor(max_workers=max_workers) as pool:
+		futures = {pool.submit(_process_event, ev): ev for ev in all_events}
+		with tqdm(total=len(all_events), desc="Processing events", unit="event") as pbar:
+			for fut in as_completed(futures):
+				count = fut.result()
+				with count_lock:
+					processed_count += count
+				pbar.update(1)
 
 	logger.info(f"Processing complete. {processed_count} cutouts created.")
 
