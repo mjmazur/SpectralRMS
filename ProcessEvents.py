@@ -229,7 +229,36 @@ def main():
 			ev = parse_ev_filename(event_root)
 			if ev: all_events.append(ev)
 	elif event_root.is_dir():
-		all_txt = sorted([f for f in event_root.rglob("*") if f.is_file() and f.suffix == ".txt"])
+		# Derive date range from CapturedFiles directories (stationID_YYYYMMDD_HHmmss_uuuuuu)
+		captured_dir = Path(getattr(config, 'data_dir', '')) / 'CapturedFiles'
+		capture_dates = set()
+		if captured_dir.is_dir():
+			for d in captured_dir.iterdir():
+				if d.is_dir():
+					parts = d.name.split('_')
+					if len(parts) >= 2 and len(parts[1]) == 8 and parts[1].isdigit():
+						capture_dates.add(parts[1])  # YYYYMMDD
+
+		if capture_dates:
+			start_date = min(capture_dates)
+			end_date = max(capture_dates)
+			logger.info(f"Limiting event scan to dates {start_date} – {end_date} (from {captured_dir})")
+		else:
+			logger.warning(f"Could not determine date range from {captured_dir}; scanning all dates.")
+			start_date = end_date = None
+
+		# Collect candidate YYYYMMDD subdirectories within the date range
+		date_dirs = sorted([
+			d for d in event_root.iterdir()
+			if d.is_dir() and len(d.name) == 8 and d.name.isdigit()
+			and (start_date is None or start_date <= d.name <= end_date)
+		])
+
+		if not date_dirs:
+			logger.warning(f"No date directories found in {event_root} for range {start_date}–{end_date}; falling back to full scan.")
+			date_dirs = [event_root]
+
+		all_txt = sorted([f for d in date_dirs for f in d.rglob("*") if f.is_file() and f.suffix == ".txt"])
 		for f in tqdm(all_txt, desc="Scanning event files", unit="file"):
 			if "corr.txt" in f.name.lower():
 				all_events.extend(parse_corr_file(f))
