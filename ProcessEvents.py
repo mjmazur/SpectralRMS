@@ -208,6 +208,7 @@ def main():
 	args = arg_parser.parse_args()
 
 	# Load configuration
+	print(args.config)
 	config = cr.loadConfigFromDirectory(args.config, os.path.abspath("."))
 	logger.info("Loaded configuration successfully!")
 
