@@ -209,7 +209,7 @@ def main():
 
 	# Load configuration
 	print(args.config)
-	config = cr.loadConfigFromDirectory(args.config, os.path.abspath("."))
+	config = cr.loadConfigFromDirectory([args.config], os.path.abspath("."))
 	logger.info("Loaded configuration successfully!")
 
 	# Resolve event path
