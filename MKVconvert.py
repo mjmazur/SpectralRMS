@@ -206,9 +206,11 @@ def cutout_from_mkv(video_path: Path, start_time: datetime, end_time: datetime, 
 
 	if output_file.exists():
 		logger.info(f"Cutout already exists: {output_file}")
+		print(f"Cutout already exists: {output_file}")
 		return output_file
 
 	logger.info(f"Cutting {video_path} from {ss:.2f}s to {to:.2f}s -> {output_file}")
+	print(f"Cutting {video_path} from {ss:.2f}s to {to:.2f}s -> {output_file}")
 	try:
 		(
 			ffmpeg
@@ -216,9 +218,11 @@ def cutout_from_mkv(video_path: Path, start_time: datetime, end_time: datetime, 
 			.output(str(output_file))
 			.run(quiet=True, overwrite_output=True)
 		)
+		print(f"Successfully created cutout: {output_file}")
 		return output_file
 	except ffmpeg.Error as e:
 		logger.error(f"FFmpeg error: {e.stderr.decode() if e.stderr else str(e)}")
+		print(f"FFmpeg error: {e.stderr.decode() if e.stderr else str(e)}")
 		return None
 
 def sync_to_remote(local_dir: Path, remote_path: str):

@@ -156,6 +156,7 @@ def cutout_from_mkv(video_path: Path, start_time: datetime, end_time: datetime, 
 		file_time = video_to_datetime(video_path.name)
 	except ValueError as e:
 		logger.error(f"Could not parse datetime from {video_path.name}: {e}")
+		print(f"Could not parse datetime from {video_path.name}: {e}")
 		return None
 	
 	ss = max(0, (start_time - file_time).total_seconds())
@@ -168,9 +169,11 @@ def cutout_from_mkv(video_path: Path, start_time: datetime, end_time: datetime, 
 
 	if output_file.exists():
 		logger.info(f"Cutout already exists: {output_file}")
+		print(f"Cutout already exists: {output_file}")
 		return output_file
 
 	logger.info(f"Cutting {video_path} from {ss:.2f}s to {to:.2f}s -> {output_file}")
+	print(f"Cutting {video_path} from {ss:.2f}s to {to:.2f}s -> {output_file}")
 	try:
 		(
 			ffmpeg
@@ -178,24 +181,70 @@ def cutout_from_mkv(video_path: Path, start_time: datetime, end_time: datetime, 
 			.output(str(output_file))
 			.run(quiet=True, overwrite_output=True)
 		)
+		print(f"Successfully created cutout: {output_file}")
 		return output_file
 	except ffmpeg.Error as e:
 		logger.error(f"FFmpeg error: {e.stderr.decode() if e.stderr else str(e)}")
+		print(f"FFmpeg error: {e.stderr.decode() if e.stderr else str(e)}")
 		return None
 
 def sync_to_remote(local_dir: Path, remote_path: str):
-	"""Syncs the local directory to a remote path using rsync."""
-	logger.info(f"Syncing {local_dir} to {remote_path}...")
-	try:
-		# -a: archive mode, -v: verbose, -z: compress, --progress: show progress
-		cmd = ["rsync", "-avz", str(local_dir) + "/", remote_path]
-		result = subprocess.run(cmd, capture_output=True, text=True)
-		if result.returncode == 0:
-			logger.info("Rsync completed successfully.")
-		else:
-			logger.error(f"Rsync failed with return code {result.returncode}: {result.stderr}")
-	except Exception as e:
-		logger.error(f"Error during rsync: {e}")
+	"""Syncs files under local_dir to remote_path, grouping them into per-date subdirectories.
+
+	For each output file whose name contains a YYYYMMDD date token (e.g. ev_20260404_...),
+	the file is placed under remote_path/YYYYMMDD/.  Files that don't match fall back to
+	remote_path directly.  The --mkpath flag tells rsync to create remote directories as needed.
+	"""
+	import re
+	date_pattern = re.compile(r'ev_(\d{8})_')
+
+	# Collect all regular files directly inside local_dir (cutouts sit flat per camera dir)
+	all_files = [f for f in local_dir.rglob("*") if f.is_file()]
+	if not all_files:
+		logger.warning(f"No files found under {local_dir} to sync.")
+		return
+
+	# Group files by YYYYMMDD (or None for unrecognised names)
+	groups: Dict[Optional[str], List[Path]] = {}
+	for f in all_files:
+		m = date_pattern.search(f.name)
+		date_key = m.group(1) if m else None
+		groups.setdefault(date_key, []).append(f)
+
+	errors = 0
+	for date_key, files in sorted(groups.items(), key=lambda x: (x[0] or "")):
+		dest = f"{remote_path.rstrip('/')}/{date_key}/" if date_key else f"{remote_path.rstrip('/')}/"
+		logger.info(f"Syncing {len(files)} file(s) for date {date_key or '(unknown)'} -> {dest}")
+		# Pass explicit file list via --files-from (written to a temp file)
+		import tempfile
+		with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as tmp:
+			tmp_path = tmp.name
+			for f in files:
+				# rsync --files-from paths are relative to the source root
+				tmp.write(str(f.relative_to(local_dir)) + "\n")
+		try:
+			cmd = [
+				"rsync", "-avz", "--mkpath",
+				"--files-from", tmp_path,
+				str(local_dir) + "/",
+				dest,
+			]
+			result = subprocess.run(cmd, capture_output=True, text=True)
+			if result.returncode == 0:
+				logger.info(f"  Rsync to {dest} completed successfully.")
+			else:
+				logger.error(f"  Rsync to {dest} failed (code {result.returncode}): {result.stderr.strip()}")
+				errors += 1
+		except Exception as e:
+			logger.error(f"  Error during rsync to {dest}: {e}")
+			errors += 1
+		finally:
+			os.unlink(tmp_path)
+
+	if errors == 0:
+		logger.info("All rsync operations completed successfully.")
+	else:
+		logger.warning(f"Rsync finished with {errors} error(s).")
 
 def main():
 	arg_parser = argparse.ArgumentParser(description="Process meteor events and create MKV cutouts.")
