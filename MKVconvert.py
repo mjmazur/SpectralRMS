@@ -298,7 +298,8 @@ def main():
 	logger.info("Loaded configuration successfully!")
 
 	# Resolve detection path
-	det_path = Path(args.detections) if args.detections else Path(config.data_dir) / (config.video_dir if hasattr(config, "video_dir") else config.raw_video_dir)
+	# det_path = Path(args.detections) if args.detections else Path(config.data_dir) / (config.video_dir if hasattr(config, "video_dir") else config.raw_video_dir)
+	det_path = Path(args.detections) if args.detections else Path(config.data_dir)
 	detections = read_detections_from_dir(str(det_path), config)
 
 	print(det_path)
