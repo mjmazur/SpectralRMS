@@ -319,6 +319,8 @@ def main():
 		logger.error(f"No MKV files found in {mkv_root}")
 		return
 
+	print(mkv_files)
+
 	mkv_datetimes = []
 	valid_mkv_files = []
 	for f in mkv_files:
