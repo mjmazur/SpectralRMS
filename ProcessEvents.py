@@ -224,16 +224,16 @@ def sync_to_remote(local_dir: Path, remote_path: str):
 				tmp.write(str(f.relative_to(local_dir)) + "\n")
 		try:
 			cmd = [
-				"rsync", "-avz", "--mkpath",
+				"rsync", "-avh", "--progress", "--ignore-existing", "--mkpath",
 				"--files-from", tmp_path,
 				str(local_dir) + "/",
 				dest,
 			]
-			result = subprocess.run(cmd, capture_output=True, text=True)
+			result = subprocess.run(cmd)
 			if result.returncode == 0:
 				logger.info(f"  Rsync to {dest} completed successfully.")
 			else:
-				logger.error(f"  Rsync to {dest} failed (code {result.returncode}): {result.stderr.strip()}")
+				logger.error(f"  Rsync to {dest} failed (code {result.returncode})")
 				errors += 1
 		except Exception as e:
 			logger.error(f"  Error during rsync to {dest}: {e}")
