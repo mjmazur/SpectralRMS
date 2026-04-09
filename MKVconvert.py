@@ -301,6 +301,8 @@ def main():
 	det_path = Path(args.detections) if args.detections else Path(config.data_dir) / (config.video_dir if hasattr(config, "video_dir") else config.raw_video_dir)
 	detections = read_detections_from_dir(str(det_path), config)
 
+	print(detections)
+
 	# Resolve MKV path
 	if args.vid_path:
 		mkv_root = Path(args.vid_path)
@@ -318,8 +320,6 @@ def main():
 	if not mkv_files:
 		logger.error(f"No MKV files found in {mkv_root}")
 		return
-
-	print(mkv_files)
 
 	mkv_datetimes = []
 	valid_mkv_files = []
