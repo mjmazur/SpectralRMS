@@ -224,7 +224,7 @@ def sync_to_remote(local_dir: Path, remote_path: str):
 				tmp.write(str(f.relative_to(local_dir)) + "\n")
 		try:
 			cmd = [
-				"rsync", "-avh", "--progress", "--ignore-existing", "--mkpath",
+				"rsync", "-avh", "--progress", "--ignore-existing",
 				"--files-from", tmp_path,
 				str(local_dir) + "/",
 				dest,
