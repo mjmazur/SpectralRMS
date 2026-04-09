@@ -70,6 +70,7 @@ def get_ftp_detectinfo_files(path: Path) -> List[Path]:
 def read_detections_from_dir(ff_path_str: str, config) -> List[MeteorDetection]:
 	"""Gets the detections from FTPdetectinfo files in the given directory."""
 	ff_path = Path(ff_path_str)
+	print("ff_path", ff_path)
 	ftp_files = get_ftp_detectinfo_files(ff_path)
 
 	detections = []
