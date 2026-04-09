@@ -253,7 +253,7 @@ def main():
 	args = arg_parser.parse_args()
 
 	# Load configuration
-	config = cr.loadConfigFromDirectory(args.config, os.path.abspath("."))
+	config = cr.loadConfigFromDirectory([args.config], os.path.abspath("."))
 	logger.info("Loaded configuration successfully!")
 
 	# Resolve detection path
